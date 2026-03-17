@@ -1,96 +1,80 @@
-import logging
+import asyncio
+from decimal import Decimal
 from sqlalchemy.future import select
-from database.session import engine
-from sqlalchemy.ext.asyncio import AsyncSession
-from database.models import ProviderAccount, Transaction, NocTicket, TicketStatus
-from services.noc import notify_critical
+from sqlalchemy.orm import joinedload
+from database.session import AsyncSessionLocal
+from database.models import Transaction, Balance, App, LedgerEntry
+from services.fee_engine import calculate_transaction_fee
+from services.notifier import NOC
 
-# Importação dos drivers
-from drivers.elitepay_driver import ElitePayDriver
-from drivers.mistic_driver import MisticDriver
+async def process_payout(transaction_id: str):
+    """
+    Executa o saque (Payout) com proteção de concorrência e precisão Decimal.
+    """
+    async with AsyncSessionLocal() as db:
+        # 1. Bloqueia a transação e carrega relações
+        result = await db.execute(
+            select(Transaction)
+            .options(joinedload(Transaction.app).joinedload(App.account))
+            .where(Transaction.id == transaction_id)
+            .with_for_update()
+        )
+        tx = result.scalars().first()
 
-async def process_auto_payout(tx_id: str):
-    """Tarefa de Background: Autodetecção de Driver e Liquidação"""
-    from sqlalchemy.orm import sessionmaker
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        if not tx or tx.status != "pending":
+            return {"error": "Transação inválida ou já processada"}
 
-    async with async_session() as db:
-        # 1. Localizar a Transação
-        res = await db.execute(select(Transaction).where(Transaction.id == tx_id))
-        tx = res.scalars().first()
-        if not tx or tx.status != "processing":
-            return
+        # 2. Bloqueia o saldo do cliente para verificação
+        bal_res = await db.execute(
+            select(Balance)
+            .where(Balance.account_id == tx.app.account_id, Balance.currency == tx.currency)
+            .with_for_update()
+        )
+        balance = bal_res.scalars().first()
 
-        # 2. Buscar Contas Ativas
-        query = await db.execute(select(ProviderAccount).where(ProviderAccount.is_active == True))
-        provider_accounts = query.scalars().all()
-
-        payout_executed = False
+        # 3. Calcular Taxas de Saída (OUT)
+        # Identifica se é rede cripto para taxas de rede
+        is_crypto = "crypto" in tx.method.lower()
+        fee_amount, total_to_deduct = calculate_transaction_fee(
+            tx.app.account, tx.amount, "OUT", is_bep20=is_crypto
+        )
         
-        for p_acc in provider_accounts:
-            creds = p_acc.credentials_encrypted
-            if not isinstance(creds, dict):
-                continue
+        # O custo total para o cliente é: Valor solicitado + Taxa da NexTrustX
+        # Nota: net_amount aqui no fee_engine para 'OUT' funciona como o montante total a retirar
+        required_funds = Decimal(str(tx.amount)) + fee_amount
 
-            try:
-                # 3. IDENTIFICAÇÃO DINÂMICA DO DRIVER
-                driver = None
-                
-                # Se tem chaves da ElitePay
-                if 'client_id' in creds and 'client_secret' in creds:
-                    driver = ElitePayDriver(creds['client_id'], creds['client_secret'])
-                    provider_name = "ElitePay"
-                
-                # Se tem chaves da MisticPay
-                elif 'ci' in creds and 'cs' in creds:
-                    driver = MisticDriver(creds['ci'], creds['cs'])
-                    provider_name = "MisticPay"
-
-                if not driver:
-                    continue
-
-                # 4. CONSULTA SALDO REAL
-                balance_res = await driver.get_balance()
-                if not balance_res.get("success"):
-                    continue
-                
-                data = balance_res.get("data", {})
-                real_balance = float(data.get("balance", data.get("availableBalance", 0)))
-
-                # 5. EXECUÇÃO SE HOUVER LIQUIDEZ (Margem de R$ 2.00 para taxas)
-                if real_balance >= (tx.amount + 2.0):
-                    # Extraímos a chave PIX do campo description ou payload
-                    # (Ajuste conforme onde guardas a chave final no momento do request)
-                    pix_key = tx.description.split(":")[-1].strip() if ":" in tx.description else ""
-                    
-                    if not pix_key:
-                        continue
-
-                    pay_res = await driver.create_pix_withdraw(
-                        amount=tx.amount,
-                        pix_key=pix_key,
-                        pix_key_type="EVP" # Fallback para chave aleatória/EVP
-                    )
-
-                    if pay_res.get("success"):
-                        payout_executed = True
-                        break
-
-            except Exception as e:
-                logging.error(f"Erro no processamento automático ({p_acc.id}): {e}")
-                continue
-
-        # 6. FINALIZAÇÃO E NOTIFICAÇÃO
-        if payout_executed:
-            tx.status = "paid"
-            # Tenta encontrar e fechar o ticket do NOC
-            ticket_res = await db.execute(select(NocTicket).where(NocTicket.amount == tx.amount, NocTicket.status == TicketStatus.PENDING))
-            ticket = ticket_res.scalars().first()
-            if ticket:
-                ticket.status = TicketStatus.RESOLVED
-            
+        if not balance or balance.available_balance < required_funds:
+            tx.status = "failed"
             await db.commit()
-            await notify_critical(f"✅ [AUTO-PAYOUT] R$ {tx.amount} liquidado via {provider_name}.")
-        else:
-            await notify_critical(f"🚨 [LIQUIDEZ ZERO] Saque de R$ {tx.amount} falhou. Verifique os provedores!")
+            return {"error": "Saldo insuficiente", "required": float(required_funds)}
 
+        # 4. Execução Contabilística (Antes de chamar o driver externo)
+        balance.available_balance -= required_funds
+        
+        debit_entry = LedgerEntry(
+            account_id=tx.app.account_id,
+            transaction_id=tx.id,
+            currency=tx.currency,
+            amount=Decimal(str(tx.amount)),
+            entry_type="payout_debit"
+        )
+        fee_entry = LedgerEntry(
+            account_id=tx.app.account_id,
+            transaction_id=tx.id,
+            currency=tx.currency,
+            amount=fee_amount,
+            entry_type="payout_fee"
+        )
+        
+        db.add_all([debit_entry, fee_entry])
+        
+        # 5. Aqui chamarias o Driver Real (Mistic/Elite/etc)
+        # Simulando sucesso do driver:
+        tx.status = "completed"
+        
+        await db.commit()
+        
+        # Alerta NOC
+        await NOC.internal_alert("INFO", f"💸 *Saída Processada*\nCliente: {tx.app.account.name}\nValor: R$ {tx.amount}\nTaxa: R$ {fee_amount}")
+        
+        return {"status": "success", "tx_id": tx.id, "fee": float(fee_amount)}

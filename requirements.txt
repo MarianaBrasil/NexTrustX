@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+httpx
+sqlalchemy
+asyncpg
+alembic
+pydantic
+pydantic-settings
+redis
+celery
+cryptography # Para encriptar as credenciais da Mistic/ElitePay na Base de Dados
